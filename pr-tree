@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+# pr-tree: PRの親子関係をツリー表示する
+# Usage: pr-tree [--open] [branch]
+# 依存: gh (GitHub CLI), git
+
+import subprocess
+import sys
+import json
+import argparse
+import os
+import re
+from urllib.parse import quote
+
+BOLD  = '\033[1m'
+CYAN  = '\033[0;36m'
+GREEN = '\033[0;32m'
+YELLOW = '\033[0;33m'
+MAGENTA = '\033[0;35m'
+RED   = '\033[0;31m'
+DIM   = '\033[0;90m'
+RESET = '\033[0m'
+
+STATE_COLOR = {
+    'OPEN':   GREEN,
+    'DRAFT':  YELLOW,
+    'MERGED': MAGENTA,
+    'CLOSED': RED,
+}
+
+ROOT_BRANCH = "develop"
+CONFIG_FILE = ".pr-tree"
+
+_repo_url   = None
+_repo_owner = None
+_repo_name  = None
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def gh_json(args):
+    result = subprocess.run(["gh"] + args, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def get_repo_root():
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def load_root_branch():
+    repo_root = get_repo_root()
+    if not repo_root:
+        return None
+    config_path = os.path.join(repo_root, CONFIG_FILE)
+    if os.path.exists(config_path):
+        value = open(config_path).read().strip()
+        return value if value else None
+    return None
+
+
+def save_root_branch(branch):
+    repo_root = get_repo_root()
+    if not repo_root:
+        print("Warning: gitリポジトリが見つかりません", file=sys.stderr)
+        return
+    with open(os.path.join(repo_root, CONFIG_FILE), "w") as f:
+        f.write(branch + "\n")
+    print(f"設定を保存しました (root={branch})", file=sys.stderr)
+
+
+def get_repo_info():
+    global _repo_url, _repo_owner, _repo_name
+    if _repo_url is None:
+        data = gh_json(["repo", "view", "--json", "url,owner,name"])
+        if data:
+            _repo_url   = data["url"]
+            _repo_owner = data["owner"]["login"]
+            _repo_name  = data["name"]
+        else:
+            _repo_url = _repo_owner = _repo_name = ""
+
+
+def branch_url(branch):
+    get_repo_info()
+    return f"{_repo_url}/tree/{quote(branch, safe='/')}"
+
+
+_issue_cache = {}
+
+def get_linked_issues(pr_number):
+    if pr_number in _issue_cache:
+        return _issue_cache[pr_number]
+    get_repo_info()
+    query = (
+        f'{{ repository(owner:"{_repo_owner}", name:"{_repo_name}") '
+        f'{{ pullRequest(number:{pr_number}) '
+        f'{{ closingIssuesReferences(first:10) {{ nodes {{ number title url }} }} }} }} }}'
+    )
+    result = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        capture_output=True, text=True
+    )
+    issues = []
+    if result.returncode == 0:
+        try:
+            data = json.loads(result.stdout)
+            nodes = (data.get("data", {})
+                        .get("repository", {})
+                        .get("pullRequest", {})
+                        .get("closingIssuesReferences", {})
+                        .get("nodes", []))
+            issues = nodes
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    _issue_cache[pr_number] = issues
+    return issues
+
+
+def effective_state(pr):
+    if pr["state"] == "OPEN" and pr["isDraft"]:
+        return "DRAFT"
+    return pr["state"]
+
+
+def state_badge(pr):
+    state = effective_state(pr)
+    color = STATE_COLOR.get(state, RESET)
+    return f"{color}[{state.lower()}]{RESET}"
+
+
+def load_all_prs():
+    """gh pr list --state all で全PR一括取得"""
+    print("PRツリーを取得中...", file=sys.stderr)
+    data = gh_json([
+        "pr", "list", "--state", "all",
+        "--json", "number,title,state,isDraft,headRefName,baseRefName,url",
+        "--limit", "500",
+    ])
+    return data or []
+
+
+def build_maps(prs):
+    head_to_pr  = {}
+    base_to_prs = {}
+    for pr in prs:
+        head_to_pr[pr["headRefName"]] = pr
+        base_to_prs.setdefault(pr["baseRefName"], []).append(pr)
+    return head_to_pr, base_to_prs
+
+
+def collect_chain(branch, head_to_pr):
+    """branch から ROOT_BRANCH まで祖先チェーンを収集。
+    各要素は (branch_name, pr_or_None)。先頭が ROOT_BRANCH。"""
+    chain = []
+    current = branch
+    visited = set()
+
+    while current and current != ROOT_BRANCH:
+        if current in visited:
+            break
+        visited.add(current)
+        pr = head_to_pr.get(current)
+        chain.insert(0, (current, pr))
+        if not pr:
+            break
+        current = pr["baseRefName"]
+
+    chain.insert(0, (ROOT_BRANCH, None))
+    return chain
+
+
+# ===== CLI出力 =====
+
+def print_subtree_cli(pr, prefix, is_last, base_to_prs, visited, target_branch):
+    if pr["number"] in visited:
+        return
+    visited.add(pr["number"])
+
+    connector    = "└── " if is_last else "├── "
+    child_prefix = (prefix + "    ") if is_last else (prefix + "│   ")
+    is_target    = (pr["headRefName"] == target_branch)
+
+    badge = state_badge(pr)
+    title_str  = f"{BOLD}{CYAN}{pr['title']}{RESET}" if is_target else pr["title"]
+    branch_str = f"{BOLD}{CYAN}{pr['headRefName']}{RESET}" if is_target else f"{DIM}{pr['headRefName']}{RESET}"
+    print(f"{prefix}{connector}{YELLOW}#{pr['number']}{RESET} {badge} {title_str}")
+    print(f"{child_prefix}  {branch_str}")
+
+    children = base_to_prs.get(pr["headRefName"], [])
+    for i, child in enumerate(children):
+        print_subtree_cli(child, child_prefix, i == len(children) - 1, base_to_prs, visited, target_branch)
+
+
+def output_cli(chain, target_branch, head_to_pr, base_to_prs):
+    visited_prs = set()
+    root = chain[0][0]
+    print(f"{BOLD}{root}{RESET}")
+
+    if len(chain) < 2:
+        return
+
+    # L1: develop直下の一ノード
+    l1_branch, l1_pr = chain[1]
+    is_target = (l1_branch == target_branch)
+    child_prefix = "    "
+
+    if l1_pr:
+        visited_prs.add(l1_pr["number"])
+        badge = state_badge(l1_pr)
+        title_str  = f"{BOLD}{CYAN}{l1_pr['title']}{RESET}" if is_target else l1_pr["title"]
+        branch_str = f"{BOLD}{CYAN}{l1_branch}{RESET}" if is_target else f"{DIM}{l1_branch}{RESET}"
+        print(f"└── {YELLOW}#{l1_pr['number']}{RESET} {badge} {title_str}")
+        print(f"{child_prefix}  {branch_str}")
+    else:
+        branch_str = f"{BOLD}{CYAN}{l1_branch}{RESET}" if is_target else l1_branch
+        print(f"└── {branch_str} {DIM}(no PR){RESET}")
+
+    # L2以降: L1の全子孫を網羅表示（カレントブランチをハイライト）
+    children = base_to_prs.get(l1_branch, [])
+    for i, child in enumerate(children):
+        print_subtree_cli(child, child_prefix, i == len(children) - 1, base_to_prs, visited_prs, target_branch)
+
+
+# ===== HTML出力 =====
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>pr-tree: {target}</title>
+<style>
+  body {{
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 13px;
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 24px;
+  }}
+  .trunk {{
+    border-left: 1px solid #5c6a7a;
+    margin-left: 10px;
+  }}
+  .node-row {{
+    display: flex;
+    align-items: flex-start;
+  }}
+  .branch {{
+    position: relative;
+    top: 0.8em;
+    width: 14px;
+    min-width: 14px;
+    border-top: 1px solid #5c6a7a;
+    flex-shrink: 0;
+  }}
+  .node-content {{
+    flex: 1;
+    min-width: 0;
+    padding: 4px 0;
+  }}
+  .leaf {{
+    display: inline-block;
+    background: #1c2333;
+    border: 1px solid #5c6a7a;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin: 2px 0;
+  }}
+  .leaf.root   {{ border-color: #388bfd; }}
+  .leaf.target {{ border-color: #f0883e; }}
+  .pr-line {{ display: block; }}
+  .branch-line {{
+    display: block;
+    font-size: 11px;
+    color: #8b949e;
+    margin-top: 2px;
+    padding-left: 1em;
+  }}
+  .state {{
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: bold;
+    margin-right: 4px;
+  }}
+  .state-open   {{ background: #238636; color: #fff; }}
+  .state-draft  {{ background: #6e7681; color: #fff; }}
+  .state-merged {{ background: #8957e5; color: #fff; }}
+  .state-closed {{ background: #da3633; color: #fff; }}
+  a.pr-link {{
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 11px;
+    text-decoration: none;
+    font-weight: bold;
+    background: #238636;
+    color: #fff;
+  }}
+  a.pr-link:hover {{ opacity: 0.85; }}
+  a.issue-link {{
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 11px;
+    text-decoration: none;
+    font-weight: bold;
+    background: #1f6feb;
+    color: #fff;
+  }}
+  a.issue-link:hover {{ opacity: 0.85; }}
+  .text-link {{
+    color: #8b949e;
+    text-decoration: none;
+    cursor: pointer;
+    margin-left: 4px;
+  }}
+  .text-link:hover {{ color: #c9d1d9; }}
+  a.branch-link {{
+    color: #8b949e;
+    text-decoration: none;
+  }}
+  a.branch-link:hover {{ color: #c9d1d9; }}
+  a.branch-link.root   {{ color: #7ee787; font-weight: bold; }}
+  a.branch-link.target {{ color: #f0883e; font-weight: bold; }}
+  .no-pr {{ color: #6e7681; font-size: 11px; }}
+  h2 {{
+    color: #8b949e;
+    font-size: 12px;
+    font-weight: normal;
+    margin: 0 0 12px 0;
+  }}
+</style>
+</head>
+<body>
+<h2>pr-tree — {target}</h2>
+<div class="tree">
+{tree_html}
+</div>
+</body>
+</html>
+"""
+
+
+def make_state_badge_html(pr):
+    state = effective_state(pr)
+    cls = f"state state-{state.lower()}"
+    return f'<span class="{cls}">{state.lower()}</span>'
+
+
+def make_node_card_html(branch, pr, is_root=False, is_target=False):
+    b_url = branch_url(branch)
+    leaf_cls = "leaf" + (" root" if is_root else "") + (" target" if is_target else "")
+    branch_link_cls = "branch-link" + (" root" if is_root else "") + (" target" if is_target else "")
+
+    if is_root:
+        return (
+            f'<div class="{leaf_cls}">'
+            f'<a class="{branch_link_cls}" href="{esc(b_url)}" target="_blank">{esc(branch)}</a>'
+            f'</div>'
+        )
+
+    if pr:
+        badge = make_state_badge_html(pr)
+        issues = get_linked_issues(pr["number"])
+        issue_lines = "".join(
+            f'<span class="pr-line">'
+            f'<a class="issue-link" href="{esc(issue["url"])}" target="_blank">#{issue["number"]}</a>'
+            f'<a class="text-link" href="{esc(issue["url"])}" target="_blank">{esc(issue["title"])}</a>'
+            f'</span>'
+            for issue in issues
+        )
+        pr_line = (
+            f'{issue_lines}'
+            f'<span class="pr-line">'
+            f'{badge}'
+            f'<a class="pr-link" href="{esc(pr["url"])}" target="_blank">#{pr["number"]}</a>'
+            f'<a class="text-link" href="{esc(pr["url"])}" target="_blank">{esc(pr["title"])}</a>'
+            f'</span>'
+        )
+    else:
+        pr_line = '<span class="pr-line"><span class="no-pr">(no PR)</span></span>'
+
+    branch_line = (
+        f'<span class="branch-line">'
+        f'<a class="{branch_link_cls}" href="{esc(b_url)}" target="_blank">{esc(branch)}</a>'
+        f'</span>'
+    )
+    return f'<div class="{leaf_cls}">{pr_line}{branch_line}</div>'
+
+
+def subtree_trunk_html(prs, base_to_prs, visited, target_branch):
+    rows = []
+    for pr in prs:
+        if pr["number"] in visited:
+            continue
+        visited.add(pr["number"])
+        is_target = (pr["headRefName"] == target_branch)
+        card = make_node_card_html(pr["headRefName"], pr, is_target=is_target)
+        children = base_to_prs.get(pr["headRefName"], [])
+        child_trunk = subtree_trunk_html(children, base_to_prs, visited, target_branch)
+        rows.append(
+            f'<div class="node-row">'
+            f'<div class="branch"></div>'
+            f'<div class="node-content">{card}{child_trunk}</div>'
+            f'</div>'
+        )
+    if not rows:
+        return ""
+    return '<div class="trunk">' + "".join(rows) + "</div>"
+
+
+def output_html(chain, target_branch, base_to_prs):
+    visited = set()
+    root_branch = chain[0][0]
+    root_card = make_node_card_html(root_branch, None, is_root=True)
+
+    if len(chain) < 2:
+        return HTML_TEMPLATE.format(target=esc(target_branch), tree_html=root_card)
+
+    # L1
+    l1_branch, l1_pr = chain[1]
+    is_target = (l1_branch == target_branch)
+    if l1_pr:
+        visited.add(l1_pr["number"])
+    l1_card = make_node_card_html(l1_branch, l1_pr, is_target=is_target)
+
+    # L2以降: 全子孫を網羅
+    children = base_to_prs.get(l1_branch, [])
+    child_trunk = subtree_trunk_html(children, base_to_prs, visited, target_branch)
+
+    l1_trunk = (
+        '<div class="trunk">'
+        '<div class="node-row">'
+        '<div class="branch"></div>'
+        f'<div class="node-content">{l1_card}{child_trunk}</div>'
+        '</div>'
+        '</div>'
+    )
+    return HTML_TEMPLATE.format(target=esc(target_branch), tree_html=root_card + l1_trunk)
+
+
+# ===== メイン =====
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pr-tree",
+        description="PRの親子関係をツリー表示します"
+    )
+    parser.add_argument("branch", nargs="?", default=None, help="対象ブランチ（省略時はカレント）")
+    parser.add_argument("--open", action="store_true", help="HTMLを生成してブラウザで開く")
+    parser.add_argument("--root", default=None, help="ルートブランチを指定（.pr-treeに保存）")
+    args = parser.parse_args()
+
+    global ROOT_BRANCH
+    if args.root:
+        ROOT_BRANCH = args.root
+        save_root_branch(args.root)
+    else:
+        saved = load_root_branch()
+        if saved:
+            ROOT_BRANCH = saved
+
+    branch = args.branch or run(["git", "branch", "--show-current"])
+    if not branch:
+        print("Error: カレントブランチを取得できません", file=sys.stderr)
+        sys.exit(1)
+
+    prs = load_all_prs()
+    head_to_pr, base_to_prs = build_maps(prs)
+    chain = collect_chain(branch, head_to_pr)
+
+    print(file=sys.stderr)
+
+    if args.open:
+        html = output_html(chain, branch, base_to_prs)
+        safe_name = re.sub(r'[^\w\-.]', '_', branch)
+        path = f"/tmp/pr-tree-{safe_name}.html"
+        with open(path, "w") as f:
+            f.write(html)
+        print(f"Opening {path} ...", file=sys.stderr)
+        subprocess.run(["open", path])
+    else:
+        output_cli(chain, branch, head_to_pr, base_to_prs)
+
+
+if __name__ == "__main__":
+    main()
