@@ -92,6 +92,15 @@ def branch_url(branch):
     return f"{_repo_url}/tree/{quote(branch, safe='/')}"
 
 
+_root_commit_cache = {}
+
+def get_root_commit(branch):
+    if branch not in _root_commit_cache:
+        result = run(["git", "rev-parse", "--short", branch])
+        _root_commit_cache[branch] = result if result else None
+    return _root_commit_cache[branch]
+
+
 _issue_cache = {}
 
 def get_linked_issues(pr_number):
@@ -140,7 +149,7 @@ def load_all_prs():
     print("PRツリーを取得中...", file=sys.stderr)
     data = gh_json([
         "pr", "list", "--state", "all",
-        "--json", "number,title,state,isDraft,headRefName,baseRefName,url",
+        "--json", "number,title,state,isDraft,headRefName,baseRefName,url,headRefOid",
         "--limit", "500",
     ])
     return data or []
@@ -155,6 +164,16 @@ def build_maps(prs):
     return head_to_pr, base_to_prs
 
 
+def search_pr_by_head(branch):
+    """bulk取得に含まれなかったブランチのPRを個別検索"""
+    data = gh_json([
+        "pr", "list", "--head", branch, "--state", "all",
+        "--json", "number,title,state,isDraft,headRefName,baseRefName,url,headRefOid",
+        "--limit", "1",
+    ])
+    return data[0] if data else None
+
+
 def collect_chain(branch, head_to_pr):
     """branch から ROOT_BRANCH まで祖先チェーンを収集。
     各要素は (branch_name, pr_or_None)。先頭が ROOT_BRANCH。"""
@@ -167,6 +186,10 @@ def collect_chain(branch, head_to_pr):
             break
         visited.add(current)
         pr = head_to_pr.get(current)
+        if pr is None:
+            pr = search_pr_by_head(current)
+            if pr:
+                head_to_pr[current] = pr
         chain.insert(0, (current, pr))
         if not pr:
             break
@@ -336,19 +359,109 @@ HTML_TEMPLATE = """\
   a.branch-link.root   {{ color: #7ee787; font-weight: bold; }}
   a.branch-link.target {{ color: #f0883e; font-weight: bold; }}
   .no-pr {{ color: #6e7681; font-size: 11px; }}
+  .commit-line {{
+    display: block;
+    font-size: 10px;
+    color: #6e7681;
+    margin-top: 1px;
+    padding-left: 1em;
+    font-family: 'Menlo', 'Consolas', monospace;
+  }}
+  .copy-btn {{
+    display: inline-flex;
+    align-items: center;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #6e7681;
+    padding: 0 3px;
+    font-size: 11px;
+    line-height: 1;
+    vertical-align: middle;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+  }}
+  .leaf:hover .copy-btn {{ opacity: 1; }}
+  .copy-btn:hover {{ color: #c9d1d9; }}
   h2 {{
     color: #8b949e;
     font-size: 12px;
     font-weight: normal;
-    margin: 0 0 12px 0;
+    margin: 0 0 8px 0;
   }}
+  .filter-bar {{
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+    font-size: 12px;
+    color: #8b949e;
+  }}
+  .filter-bar label {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+  }}
+  .filter-bar input[type="checkbox"] {{ cursor: pointer; }}
 </style>
 </head>
 <body>
 <h2>pr-tree — {target}</h2>
+<div class="filter-bar">
+  <label><input type="checkbox" id="show-merged"> merged</label>
+  <label><input type="checkbox" id="show-closed"> closed</label>
+</div>
 <div class="tree">
 {tree_html}
 </div>
+<script>
+function applyFilter() {{
+  var showMerged = document.getElementById('show-merged').checked;
+  var showClosed = document.getElementById('show-closed').checked;
+  document.querySelectorAll('.node-row[data-state]').forEach(function(row) {{
+    var s = row.getAttribute('data-state');
+    var hide = (s === 'merged' && !showMerged) || (s === 'closed' && !showClosed);
+    row.style.display = hide ? 'none' : '';
+  }});
+}}
+document.getElementById('show-merged').addEventListener('change', applyFilter);
+document.getElementById('show-closed').addEventListener('change', applyFilter);
+applyFilter();
+
+function copyToClipboard(text, btn) {{
+  var orig = btn.textContent;
+  function showDone() {{
+    btn.textContent = '✓';
+    btn.style.color = '#3fb950';
+    btn.style.opacity = '1';
+    setTimeout(function() {{
+      btn.textContent = orig;
+      btn.style.color = '';
+      btn.style.opacity = '';
+    }}, 1200);
+  }}
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).then(showDone);
+  }} else {{
+    var el = document.createElement('textarea');
+    el.value = text;
+    el.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(el);
+    el.select();
+    try {{ document.execCommand('copy'); }} catch(e) {{}}
+    document.body.removeChild(el);
+    showDone();
+  }}
+}}
+document.querySelectorAll('.copy-btn').forEach(function(btn) {{
+  btn.addEventListener('click', function(e) {{
+    e.preventDefault();
+    e.stopPropagation();
+    copyToClipboard(this.getAttribute('data-copy'), this);
+  }});
+}});
+</script>
 </body>
 </html>
 """
@@ -360,17 +473,34 @@ def make_state_badge_html(pr):
     return f'<span class="{cls}">{state.lower()}</span>'
 
 
+def copy_btn(text):
+    return f'<button class="copy-btn" data-copy="{esc(text)}" title="クリップボードにコピー">⎘</button>'
+
+
 def make_node_card_html(branch, pr, is_root=False, is_target=False):
     b_url = branch_url(branch)
     leaf_cls = "leaf" + (" root" if is_root else "") + (" target" if is_target else "")
     branch_link_cls = "branch-link" + (" root" if is_root else "") + (" target" if is_target else "")
 
     if is_root:
+        commit = get_root_commit(branch)
+        commit_html = (
+            f'<span class="commit-line">'
+            f'<span>{esc(commit)}</span>'
+            f'{copy_btn(commit)}'
+            f'</span>'
+        ) if commit else ""
         return (
             f'<div class="{leaf_cls}">'
+            f'<span class="pr-line">'
             f'<a class="{branch_link_cls}" href="{esc(b_url)}" target="_blank">{esc(branch)}</a>'
+            f'{copy_btn(branch)}'
+            f'</span>'
+            f'{commit_html}'
             f'</div>'
         )
+
+    short_hash = pr["headRefOid"][:7] if pr and pr.get("headRefOid") else None
 
     if pr:
         badge = make_state_badge_html(pr)
@@ -396,9 +526,16 @@ def make_node_card_html(branch, pr, is_root=False, is_target=False):
     branch_line = (
         f'<span class="branch-line">'
         f'<a class="{branch_link_cls}" href="{esc(b_url)}" target="_blank">{esc(branch)}</a>'
+        f'{copy_btn(branch)}'
         f'</span>'
     )
-    return f'<div class="{leaf_cls}">{pr_line}{branch_line}</div>'
+    commit_line = (
+        f'<span class="commit-line">'
+        f'<span>{esc(short_hash)}</span>'
+        f'{copy_btn(short_hash)}'
+        f'</span>'
+    ) if short_hash else ""
+    return f'<div class="{leaf_cls}">{pr_line}{branch_line}{commit_line}</div>'
 
 
 def subtree_trunk_html(prs, base_to_prs, visited, target_branch):
@@ -412,7 +549,7 @@ def subtree_trunk_html(prs, base_to_prs, visited, target_branch):
         children = base_to_prs.get(pr["headRefName"], [])
         child_trunk = subtree_trunk_html(children, base_to_prs, visited, target_branch)
         rows.append(
-            f'<div class="node-row">'
+            f'<div class="node-row" data-state="{effective_state(pr).lower()}">'
             f'<div class="branch"></div>'
             f'<div class="node-content">{card}{child_trunk}</div>'
             f'</div>'
@@ -441,9 +578,10 @@ def output_html(chain, target_branch, base_to_prs):
     children = base_to_prs.get(l1_branch, [])
     child_trunk = subtree_trunk_html(children, base_to_prs, visited, target_branch)
 
+    l1_state = f' data-state="{effective_state(l1_pr).lower()}"' if l1_pr else ''
     l1_trunk = (
         '<div class="trunk">'
-        '<div class="node-row">'
+        f'<div class="node-row"{l1_state}>'
         '<div class="branch"></div>'
         f'<div class="node-content">{l1_card}{child_trunk}</div>'
         '</div>'
